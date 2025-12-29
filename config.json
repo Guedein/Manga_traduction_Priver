@@ -1,0 +1,7 @@
+{
+  "font_path": "assets/fonts/NotoSans-Regular.ttf",
+  "font_size_min": 12,
+  "font_size_max": 42,
+  "line_spacing": 1.15,
+  "text_margin": 6
+}
