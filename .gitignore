@@ -1,0 +1,31 @@
+# MacOS
+__MACOSX/
+.DS_Store
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+env/
+.venv/
+venv/
+ENV/
+build/
+dist/
+*.egg-info/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Application specific
+temp/
+output/
+*.log
+
+# Models cache (EasyOCR)
+.EasyOCR/
