@@ -1,3 +1,4 @@
+# -*- coding: utf-8 -*-
 # app/services/translate_service.py
 from __future__ import annotations
 
@@ -6,6 +7,10 @@ from typing import Dict, List, Literal, Optional, Tuple
 
 import time
 import requests
+
+from app.utils.logger import get_logger
+
+logger = get_logger("translate_service")
 
 
 TranslatorMode = Literal["online", "local"]
@@ -155,10 +160,10 @@ class TranslateService:
 
         # Si tout est en cache, retourner directement
         if not texts_to_translate:
-            print(f"✅ Cache hit : {len(texts)} traductions récupérées du cache")
+            logger.info(f"✅ Cache hit : {len(texts)} traductions récupérées du cache")
             return [r for r in cached_results if r is not None]
 
-        print(f"📊 Cache : {len(cached_results) - len(texts_to_translate)}/{len(texts)} hits, {len(texts_to_translate)} à traduire")
+        logger.debug(f"📊 Cache : {len(cached_results) - len(texts_to_translate)}/{len(texts)} hits, {len(texts_to_translate)} à traduire")
 
         # si online mais pas de clé ET pas de fallback → erreur
         if s.mode == "online" and not s.api_key.strip() and not s.auto_fallback_to_local:
@@ -183,8 +188,8 @@ class TranslateService:
         except Exception as e:
             # ✅ fallback auto si Online fail
             if s.mode == "online" and s.auto_fallback_to_local:
-                print(f"⚠️ Traduction Online échouée ({e})")
-                print("🔄 Basculement automatique vers traduction Local...")
+                logger.warning(f"⚠️ Traduction Online échouée ({e})")
+                logger.info("🔄 Basculement automatique vers traduction Local...")
                 new_translations = self._local.translate_many(texts_to_translate, s.src_lang, s.tgt_lang)
             else:
                 raise
@@ -219,7 +224,7 @@ class TranslateService:
         """Vide le cache des traductions"""
         old_size = len(self._translation_cache)
         self._translation_cache.clear()
-        print(f"🗑️ Cache vidé : {old_size} traductions supprimées")
+        logger.info(f"🗑️ Cache vidé : {old_size} traductions supprimées")
 
     def get_cache_stats(self) -> Dict[str, int]:
         """Retourne les statistiques du cache"""

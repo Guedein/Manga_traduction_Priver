@@ -1,3 +1,4 @@
+# -*- coding: utf-8 -*-
 # app/ui/main_window_v2.py
 """
 Version 2 de MainWindow avec interface à onglets :
@@ -9,6 +10,7 @@ from __future__ import annotations
 
 from pathlib import Path
 from typing import Optional, List, Tuple, cast
+import json
 
 from PySide6.QtCore import Qt, QThread, Signal, QObject
 from PySide6.QtWidgets import (
@@ -19,6 +21,7 @@ from PySide6.QtWidgets import (
 
 from app.ui.widgets.image_viewer import ImageViewer
 from app.ui.widgets.log_panel import LogPanel
+from app.ui.workers import OCRTranslateWorker, BatchWorker, DownloadWorker
 from app.services.ocr_service import OCRService
 from app.services.translate_service import TranslateService
 from app.services.translate_service import TranslatorMode
@@ -34,7 +37,8 @@ import numpy as np
 OcrResult = Tuple[str, float, list]
 
 
-class OCRTranslateWorker(QObject):
+class OCRTranslateWorkerOld(QObject):
+    """Worker pour OCR + Traduction d'une image (ancien code, gardé pour référence)"""
     finished = Signal(list, list)  # ocr_results, translations
     error = Signal(str)
     progress = Signal(int)
@@ -208,27 +212,42 @@ class DownloadWorker(QObject):
         self.base_output_dir = base_output_dir
         self.download_service = download_service
         self.auto_process = auto_process
+        self.stop_requested = False  # Flag pour arrêter le téléchargement
+
+    def stop(self):
+        """Demande l'arrêt du téléchargement"""
+        self.stop_requested = True
 
     def run(self):
         try:
+            # Callback avec vérification du stop
+            def progress_with_stop(i, t, s):
+                if self.stop_requested:
+                    raise InterruptedError("Téléchargement arrêté par l'utilisateur")
+                self.progress.emit(i, t, s)
+
             manga_name, chapter_name, downloaded_files = self.download_service.download_chapter(
                 self.chapter_url,
                 self.base_output_dir,
-                progress_callback=lambda i, t, s: self.progress.emit(i, t, s)
+                progress_callback=progress_with_stop
             )
-            self.finished.emit(manga_name, chapter_name, downloaded_files)
+
+            if not self.stop_requested:
+                self.finished.emit(manga_name, chapter_name, downloaded_files)
+        except InterruptedError as e:
+            self.error.emit(str(e))
         except Exception as e:
             self.error.emit(str(e))
 
 
 class MainWindow(QMainWindow):
-    # Mot de passe pour l'onglet développeur
-    DEV_PASSWORD = "dev123"
-
     def __init__(self):
         super().__init__()
         self.setWindowTitle("Manga Translator Pro")
         self.resize(1200, 800)
+
+        # Charger la configuration
+        self.config = self._load_config()
 
         # Variables d'état
         self.current_image_path: Optional[str] = None
@@ -257,6 +276,22 @@ class MainWindow(QMainWindow):
 
         # Créer l'interface
         self._create_ui()
+
+    def _load_config(self) -> dict:
+        """Charge la configuration depuis config.json"""
+        config_path = Path(__file__).parent.parent.parent / "config.json"
+        try:
+            with open(config_path, "r", encoding="utf-8") as f:
+                return json.load(f)
+        except Exception as e:
+            print(f"⚠️ Erreur lors du chargement de config.json : {e}")
+            # Configuration par défaut
+            return {
+                "security": {"dev_password": "dev123"},
+                "api_keys": {"deepl_api_key": ""},
+                "selenium": {"headless": True, "timeout": 30},
+                "paths": {"default_export_dir": ""}
+            }
 
     def _create_ui(self):
         """Crée l'interface principale avec onglets"""
@@ -425,9 +460,46 @@ class MainWindow(QMainWindow):
 
         btn_download = QPushButton("⬇ Télécharger seulement")
         btn_download_and_process = QPushButton("⬇ Télécharger + Traiter")
+        btn_stop_download = QPushButton("⏹️ Arrêter")
+        btn_stop_download.setEnabled(False)
+        btn_stop_download.setStyleSheet("QPushButton:enabled { background-color: #d32f2f; color: white; }")
 
         self.btn_download = btn_download
         self.btn_download_and_process = btn_download_and_process
+        self.btn_stop_download = btn_stop_download
+
+        # Configuration - Langue source
+        self.url_lang_combo = QComboBox()
+        self.url_lang_combo.addItems(["Auto", "EN", "CH", "JP", "KR"])
+
+        # Configuration - Mode de traduction
+        self.url_translate_mode_combo = QComboBox()
+        self.url_translate_mode_combo.addItems(["Online (API)", "Local (offline)"])
+
+        # Configuration - Clé API
+        self.url_api_key_edit = QLineEdit()
+        self.url_api_key_edit.setPlaceholderText("Clé API DeepL")
+        self.url_api_key_edit.setEchoMode(QLineEdit.EchoMode.Password)
+        # Charger la clé API depuis la config
+        saved_api_key = self.config.get("api_keys", {}).get("deepl_api_key", "")
+        if saved_api_key:
+            self.url_api_key_edit.setText(saved_api_key)
+
+        # Configuration - Dossier d'export
+        self.url_export_dir_label = QLabel("📁 Dossier d'export : Non configuré")
+        btn_set_url_export_dir = QPushButton("📁 Choisir dossier d'export")
+
+        # Fallback
+        self.url_fallback_chk = QCheckBox("Fallback auto Online → Local")
+        self.url_fallback_chk.setChecked(True)
+
+        # Progress bar
+        self.url_progress = QProgressBar()
+        self.url_progress.setRange(0, 100)
+        self.url_progress.setValue(0)
+
+        # Logs
+        self.url_logs = LogPanel()
 
         # Info
         info_label = QLabel(
@@ -442,24 +514,70 @@ class MainWindow(QMainWindow):
         layout = QVBoxLayout(tab)
         layout.addWidget(info_label)
         layout.addSpacing(20)
-        layout.addWidget(QLabel("URL du chapitre :"))
+
+        # Ligne 1 : URL
+        row1 = QHBoxLayout()
+        row1.addWidget(QLabel("URL du chapitre :"))
+        layout.addLayout(row1)
         layout.addWidget(self.url_edit)
         layout.addSpacing(10)
 
-        btn_layout = QHBoxLayout()
-        btn_layout.addWidget(btn_download)
-        btn_layout.addWidget(btn_download_and_process)
-        btn_layout.addStretch()
+        # Ligne 2 : Boutons
+        row2 = QHBoxLayout()
+        row2.addWidget(btn_download)
+        row2.addWidget(btn_download_and_process)
+        row2.addWidget(btn_stop_download)
+        row2.addStretch()
+        layout.addLayout(row2)
+        layout.addSpacing(20)
 
-        layout.addLayout(btn_layout)
-        layout.addStretch()
+        # Ligne 3 : Configuration langue + traduction
+        row3 = QHBoxLayout()
+        row3.addWidget(QLabel("Langue source :"))
+        row3.addWidget(self.url_lang_combo)
+        row3.addSpacing(20)
+        row3.addWidget(QLabel("Traduction :"))
+        row3.addWidget(self.url_translate_mode_combo)
+        row3.addWidget(self.url_api_key_edit)
+        row3.addWidget(self.url_fallback_chk)
+        row3.addStretch()
+        layout.addLayout(row3)
+
+        # Ligne 4 : Export
+        row4 = QHBoxLayout()
+        row4.addWidget(self.url_export_dir_label)
+        row4.addWidget(btn_set_url_export_dir)
+        row4.addStretch()
+        layout.addLayout(row4)
+
+        # Progress
+        layout.addSpacing(10)
+        layout.addWidget(self.url_progress)
+
+        # Logs
+        logs_group = QGroupBox("Journal d'activité")
+        logs_layout = QVBoxLayout(logs_group)
+        logs_layout.setContentsMargins(0, 0, 0, 0)
+        logs_layout.addWidget(self.url_logs)
+        layout.addWidget(logs_group, 1)
 
         # Connecter les signaux
         btn_download.clicked.connect(self.on_download)
         btn_download_and_process.clicked.connect(self.on_download_and_process)
+        btn_stop_download.clicked.connect(self.on_stop_download)
+        btn_set_url_export_dir.clicked.connect(self.on_set_url_export_dir)
+        self.url_translate_mode_combo.currentIndexChanged.connect(self.on_url_translate_mode_changed)
+        self.url_api_key_edit.textChanged.connect(self.on_url_api_key_changed)
+
+        # Initialiser l'affichage selon le mode
+        self.on_url_translate_mode_changed(0)
 
         # Ajouter l'onglet
         self.tabs.addTab(tab, "🌐 Téléchargement URL")
+
+        # Message initial
+        self.url_logs.log("✅ Onglet 'Téléchargement URL' prêt")
+        self.url_logs.log("📌 Configurez la langue source et le mode de traduction ci-dessus")
 
     def _create_dev_tab(self):
         """Onglet 3: Développeur (protégé par mot de passe)"""
@@ -528,7 +646,8 @@ class MainWindow(QMainWindow):
             QLineEdit.EchoMode.Password
         )
 
-        if ok and password == self.DEV_PASSWORD:
+        dev_password = self.config.get("security", {}).get("dev_password", "dev123")
+        if ok and password == dev_password:
             self.dev_unlocked = True
             self.dev_lock.hide()
             self.dev_content.show()
@@ -566,6 +685,47 @@ class MainWindow(QMainWindow):
         is_online = self.translate_mode_combo.currentIndex() == 0
         self.api_key_edit.setVisible(is_online)
         self.fallback_chk.setVisible(is_online)
+
+    def on_url_translate_mode_changed(self, _idx: int):
+        """Afficher/cacher la clé API selon le mode dans l'onglet URL"""
+        is_online = self.url_translate_mode_combo.currentIndex() == 0
+        self.url_api_key_edit.setVisible(is_online)
+        self.url_fallback_chk.setVisible(is_online)
+
+    def on_url_api_key_changed(self, text: str):
+        """Sauvegarder la clé API dans config.json quand elle change"""
+        if not hasattr(self, '_api_key_save_pending'):
+            self._api_key_save_pending = False
+
+        # Sauvegarder dans la config
+        if "api_keys" not in self.config:
+            self.config["api_keys"] = {}
+        self.config["api_keys"]["deepl_api_key"] = text
+
+        # Sauvegarder dans le fichier
+        try:
+            config_path = Path(__file__).parent.parent.parent / "config.json"
+            with open(config_path, "w", encoding="utf-8") as f:
+                json.dump(self.config, f, indent=2, ensure_ascii=False)
+
+            # Aussi mettre à jour le champ de l'onglet Local
+            if hasattr(self, 'api_key_edit'):
+                self.api_key_edit.setText(text)
+        except Exception as e:
+            print(f"⚠️ Erreur lors de la sauvegarde de la clé API : {e}")
+
+    def on_set_url_export_dir(self):
+        """Choisir le dossier d'export pour l'onglet URL"""
+        folder = QFileDialog.getExistingDirectory(
+            self,
+            "Choisir le dossier d'export",
+            str(Path.home())
+        )
+        if folder:
+            self.url_export_dir = folder
+            self.url_export_dir_label.setText(f"📁 Dossier d'export : {folder}")
+            # Aussi mettre à jour le dossier d'export de l'onglet Local
+            self.export_dir = folder
 
     def on_choose_image(self):
         path, _ = QFileDialog.getOpenFileName(
@@ -871,12 +1031,14 @@ class MainWindow(QMainWindow):
     def on_download(self):
         url = self.url_edit.text().strip()
         if not url:
-            self.logs.log("❌ Aucune URL fournie")
+            self.url_logs.log("❌ Aucune URL fournie")
             return
 
-        if not self.last_export_dir:
-            self.logs.log("❌ Aucun dossier d'export configuré")
-            self.logs.log("   → Clique sur '📁 Dossier d'export...' d'abord")
+        # Utiliser url_export_dir si configuré, sinon fallback sur last_export_dir
+        export_dir = getattr(self, 'url_export_dir', None) or getattr(self, 'last_export_dir', None)
+        if not export_dir:
+            self.url_logs.log("❌ Aucun dossier d'export configuré")
+            self.url_logs.log("   → Cliquez sur '📁 Choisir dossier d'export' d'abord")
             return
 
         self._start_download(url, auto_process=False)
@@ -884,31 +1046,53 @@ class MainWindow(QMainWindow):
     def on_download_and_process(self):
         url = self.url_edit.text().strip()
         if not url:
-            self.logs.log("❌ Aucune URL fournie")
+            self.url_logs.log("❌ Aucune URL fournie")
             return
 
-        if not self.last_export_dir:
-            self.logs.log("❌ Aucun dossier d'export configuré")
-            self.logs.log("   → Clique sur '📁 Dossier d'export...' d'abord")
+        # Utiliser url_export_dir si configuré, sinon fallback sur last_export_dir
+        export_dir = getattr(self, 'url_export_dir', None) or getattr(self, 'last_export_dir', None)
+        if not export_dir:
+            self.url_logs.log("❌ Aucun dossier d'export configuré")
+            self.url_logs.log("   → Cliquez sur '📁 Choisir dossier d'export' d'abord")
             return
 
         self._start_download(url, auto_process=True)
 
+    def on_stop_download(self):
+        """Arrêter le téléchargement en cours"""
+        if hasattr(self, '_download_worker') and self._download_worker:
+            self.url_logs.log("⏹️ Arrêt du téléchargement en cours...")
+
+            try:
+                # Demander au worker de s'arrêter
+                self._download_worker.stop()
+
+                # Le worker va lever une InterruptedError qui sera catchée dans run()
+                # et émettra un signal error, ce qui va déclencher _on_download_error
+
+            except Exception as e:
+                self.url_logs.log(f"⚠️ Erreur lors de l'arrêt : {e}")
+        else:
+            self.url_logs.log("⚠️ Aucun téléchargement en cours")
+
     def _start_download(self, url: str, auto_process: bool = False):
-        if not self.last_export_dir:
-            self.logs.log("❌ Erreur : dossier d'export non configuré")
+        # Utiliser url_export_dir si configuré, sinon fallback sur last_export_dir
+        export_dir = getattr(self, 'url_export_dir', None) or getattr(self, 'last_export_dir', None)
+        if not export_dir:
+            self.url_logs.log("❌ Erreur : dossier d'export non configuré")
             return
 
         self.btn_download.setEnabled(False)
         self.btn_download_and_process.setEnabled(False)
+        self.btn_stop_download.setEnabled(True)
         self.btn_choose.setEnabled(False)
         self.btn_run.setEnabled(False)
 
-        self.logs.log(f"⬇️ Téléchargement depuis : {url}")
+        self.url_logs.log(f"⬇️ Téléchargement depuis : {url}")
 
         self._download_worker = DownloadWorker(
             chapter_url=url,
-            base_output_dir=self.last_export_dir,
+            base_output_dir=export_dir,
             download_service=self.download_service,
             auto_process=auto_process,
         )
@@ -928,38 +1112,41 @@ class MainWindow(QMainWindow):
     def _on_download_progress(self, current: int, total: int, status_text: str):
         if total > 0:
             progress_percent = int((current / total) * 100)
-            self.progress.setValue(progress_percent)
-        self.logs.log(f"⏳ {status_text}")
+            self.url_progress.setValue(progress_percent)
+        self.url_logs.log(f"⏳ {status_text}")
 
     def _on_download_finished(self, manga_name: str, chapter_name: str, downloaded_files: List[str]):
-        self.progress.setValue(100)
-        self.logs.log(f"✅ Téléchargement terminé !")
-        self.logs.log(f"   📂 Manga : {manga_name}")
-        self.logs.log(f"   📄 Chapitre : {chapter_name}")
-        self.logs.log(f"   🖼️ {len(downloaded_files)} images téléchargées")
+        self.url_progress.setValue(100)
+        self.url_logs.log(f"✅ Téléchargement terminé !")
+        self.url_logs.log(f"   📂 Manga : {manga_name}")
+        self.url_logs.log(f"   📄 Chapitre : {chapter_name}")
+        self.url_logs.log(f"   🖼️ {len(downloaded_files)} images téléchargées")
 
         self.btn_download.setEnabled(True)
         self.btn_download_and_process.setEnabled(True)
+        self.btn_stop_download.setEnabled(False)
         self.btn_choose.setEnabled(True)
 
         if self._download_worker and self._download_worker.auto_process:
-            self.logs.log("🚀 Lancement du traitement batch automatique...")
+            self.url_logs.log("🚀 Lancement du traitement batch automatique...")
 
-            if self.last_export_dir:
-                downloaded_folder = str(Path(self.last_export_dir) / manga_name / f"chapitre {chapter_name}")
+            export_dir = getattr(self, 'url_export_dir', None) or getattr(self, 'last_export_dir', None)
+            if export_dir:
+                downloaded_folder = str(Path(export_dir) / manga_name / f"chapitre {chapter_name}")
             else:
-                self.logs.log("❌ Erreur : dossier d'export non configuré")
+                self.url_logs.log("❌ Erreur : dossier d'export non configuré")
                 return
 
             self.batch_folder_path = downloaded_folder
             self.on_run_batch()
 
     def _on_download_error(self, error_msg: str):
-        self.logs.log(f"❌ Erreur téléchargement : {error_msg}")
-        self.progress.setValue(0)
+        self.url_logs.log(f"❌ Erreur téléchargement : {error_msg}")
+        self.url_progress.setValue(0)
 
         self.btn_download.setEnabled(True)
         self.btn_download_and_process.setEnabled(True)
+        self.btn_stop_download.setEnabled(False)
         self.btn_choose.setEnabled(True)
         self.btn_run.setEnabled(bool(self.current_image_path))
 

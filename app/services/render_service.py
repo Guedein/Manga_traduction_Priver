@@ -1,3 +1,4 @@
+# -*- coding: utf-8 -*-
 # app/services/render_service.py
 from __future__ import annotations
 
@@ -7,6 +8,10 @@ from typing import List, Tuple, Optional
 import cv2
 import numpy as np
 from PIL import Image, ImageDraw, ImageFont
+
+from app.utils.logger import get_logger
+
+logger = get_logger("render_service")
 
 
 # ---------------------------
@@ -24,8 +29,8 @@ class RenderConfig:
     margin_vertical: float = 0.10    # 10% de marge verticale
 
     # Texte
-    font_path: Optional[str] = None  # Chemin vers police .ttf (None = police par d�faut)
-    font_color: Tuple[int, int, int] = (0, 0, 0)  # Noir par d�faut (RGB)
+    font_path: Optional[str] = None  # Chemin vers police .ttf (None = police par défaut)
+    font_color: Tuple[int, int, int] = (0, 0, 0)  # Noir par défaut (RGB)
     max_font_size: int = 100  # Taille max de police
     min_font_size: int = 8    # Taille min de police
     line_spacing: float = 1.2  # Espacement entre lignes (multiplicateur)
@@ -35,7 +40,7 @@ Box = List[List[int]]  # [[x,y], [x,y], [x,y], [x,y]]
 
 
 # ---------------------------
-# Utilitaires g�om�triques
+# Utilitaires géométriques
 # ---------------------------
 
 def _poly_to_aabb(poly: Box) -> Tuple[int, int, int, int]:
@@ -123,8 +128,8 @@ def _load_font(font_path: Optional[str], size: int):
         try:
             return ImageFont.truetype(font_path, size)
         except Exception as e:
-            print(f"� Impossible de charger la police {font_path}: {e}")
-            print("   � Utilisation de la police par d�faut")
+            logger.warning(f"⚠️ Impossible de charger la police {font_path}: {e}")
+            logger.info("   → Utilisation de la police par défaut")
 
     return _get_default_font(size)
 
@@ -251,7 +256,7 @@ def render_text_in_box(
     text_h = box_h - 2 * margin_y
 
     if text_w <= 0 or text_h <= 0:
-        print(f"� Box trop petite pour le texte : {box_w}x{box_h}")
+        logger.warning(f"⚠️ Box trop petite pour le texte : {box_w}x{box_h}")
         return img_bgr
 
     # Trouver taille de police optimale

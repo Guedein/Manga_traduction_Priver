@@ -1,14 +1,17 @@
+# -*- coding: utf-8 -*-
 # app/services/download_service.py
 from __future__ import annotations
 
 import re
 import os
 import time
+import base64
 from pathlib import Path
 from typing import List, Tuple, Optional, Callable
 from urllib.parse import urlparse, urljoin
 
 import cloudscraper
+import requests
 from bs4 import BeautifulSoup
 from selenium import webdriver
 from selenium.webdriver.chrome.service import Service as ChromeService
@@ -17,6 +20,10 @@ from selenium.webdriver.common.by import By
 from selenium.webdriver.support.ui import WebDriverWait
 from selenium.webdriver.support import expected_conditions as EC
 from webdriver_manager.chrome import ChromeDriverManager
+
+from app.utils.logger import get_logger
+
+logger = get_logger("download_service")
 
 
 class DownloadService:
@@ -31,9 +38,14 @@ class DownloadService:
                 'mobile': False
             }
         )
-        self.use_selenium = False  # Fallback Selenium si cloudscraper échoue
+        # Session requests normale pour les téléchargements d'images (avec cookies Selenium)
+        self.download_session = requests.Session()
 
-    def _get_page_with_selenium(self, page_url: str) -> str:
+        self.use_selenium = False  # Fallback Selenium si cloudscraper échoue
+        self.selenium_cookies = []  # Cookies récupérés de la session Selenium
+        self.selenium_driver = None  # Garder le driver Selenium ouvert pour télécharger les images
+
+    def _get_page_with_selenium(self, page_url: str) -> Tuple[str, dict]:
         """
         Utilise Selenium pour contourner les CAPTCHAs Cloudflare avancés.
 
@@ -41,7 +53,7 @@ class DownloadService:
             page_url: URL de la page à charger
 
         Returns:
-            HTML de la page après résolution du CAPTCHA
+            Tuple (html, cookies_dict) - Le HTML de la page et les cookies de session
         """
         chrome_options = ChromeOptions()
         # chrome_options.add_argument('--headless')  # Désactivé pour voir le CAPTCHA
@@ -59,15 +71,15 @@ class DownloadService:
             driver.get(page_url)
 
             # Attendre que Cloudflare charge (max 30 secondes)
-            print("⏳ Attente de la résolution du challenge Cloudflare...")
+            logger.info("⏳ Attente de la résolution du challenge Cloudflare...")
             time.sleep(5)  # Attendre un peu pour que le challenge se charge
 
             # Attendre que le body contienne du contenu (pas juste le challenge)
             wait = WebDriverWait(driver, 30)
             wait.until(lambda d: len(d.find_element(By.TAG_NAME, "body").text) > 100)
 
-            print("✅ Page chargée avec succès !")
-            print("📜 Scroll de la page pour charger toutes les images (lazy loading)...")
+            logger.info("✅ Page chargée avec succès !")
+            logger.info("📜 Scroll de la page pour charger toutes les images (lazy loading)...")
 
             # Scroller progressivement pour charger toutes les images lazy-loaded
             last_height = driver.execute_script("return document.body.scrollHeight")
@@ -89,14 +101,24 @@ class DownloadService:
             driver.execute_script("window.scrollTo(0, 0);")
             time.sleep(1)
 
-            print("✅ Toutes les images devraient être chargées !")
+            logger.info("✅ Toutes les images devraient être chargées !")
 
             # Récupérer le HTML de la page
             html = driver.page_source
-            return html
 
-        finally:
+            # Récupérer les cookies de la session Selenium (garder toutes les infos : domain, path, etc.)
+            selenium_cookies = driver.get_cookies()
+            logger.info(f"🍪 {len(selenium_cookies)} cookies récupérés de la session Selenium")
+
+            # Garder le driver ouvert pour télécharger les images
+            self.selenium_driver = driver
+            logger.info("🔓 Driver Selenium gardé ouvert pour télécharger les images")
+
+            return html, selenium_cookies
+
+        except Exception as e:
             driver.quit()
+            raise e
 
     def parse_url(self, url: str) -> Tuple[str, str]:
         """
@@ -157,10 +179,32 @@ class DownloadService:
 
         except Exception as e:
             # Si cloudscraper échoue (403, CAPTCHA, etc.), utiliser Selenium
-            print(f"⚠️ Cloudscraper a échoué ({e}), passage à Selenium...")
+            logger.warning(f"⚠️ Cloudscraper a échoué ({e}), passage à Selenium...")
             try:
-                html_content = self._get_page_with_selenium(page_url)
+                html_content, self.selenium_cookies = self._get_page_with_selenium(page_url)
                 self.use_selenium = True
+
+                # IMPORTANT: Ajouter les cookies à la session de téléchargement
+                if self.selenium_cookies:
+                    # Ajouter chaque cookie avec toutes ses propriétés
+                    for cookie in self.selenium_cookies:
+                        # Récupérer le domain et s'assurer qu'il fonctionne pour les sous-domaines
+                        domain = cookie.get('domain', '')
+
+                        # Si le domain commence par un point (ex: .manhuaus.com), il est valide pour tous les sous-domaines
+                        # Sinon, ajouter un point au début pour qu'il fonctionne sur les sous-domaines
+                        if domain and not domain.startswith('.'):
+                            domain = '.' + domain
+
+                        self.download_session.cookies.set(
+                            name=cookie['name'],
+                            value=cookie['value'],
+                            domain=domain,
+                            path=cookie.get('path', '/')
+                        )
+                        logger.debug(f"  Cookie ajouté: {cookie['name']} pour domain={domain}")
+
+                    logger.info(f"✅ {len(self.selenium_cookies)} cookies Selenium ajoutés pour domain + sous-domaines")
             except Exception as selenium_error:
                 raise RuntimeError(f"Erreur lors du téléchargement de la page (cloudscraper + Selenium) : {selenium_error}")
 
@@ -175,6 +219,7 @@ class DownloadService:
         # Stratégie 1: Chercher spécifiquement dans le conteneur de lecture (pas les pubs)
         # Pour manhuaus.com, les images du manga sont dans .reading-content ou img.page-break
         priority_selectors = [
+            'img.wp-manga-chapter-img',  # Classe spécifique des pages de manga
             'div.reading-content img',
             'img.page-break',  #Images avec classe page-break directement
             'div.page-break img',
@@ -202,15 +247,11 @@ class DownloadService:
         for selector in priority_selectors:
             images = soup.select(selector)
             if images:
-                print(f"🔍 Trouvé {len(images)} images avec le sélecteur '{selector}'")
+                logger.info(f"🔍 Trouvé {len(images)} images avec le sélecteur '{selector}'")
                 for img in images:
-                    # Vérifier si l'image a une classe/id de pub
-                    img_class = ' '.join(img.get('class', [])).lower()
-                    img_id = (img.get('id') or '').lower()
-
-                    # Exclure les images avec des classes/IDs de pub
-                    if any(kw in img_class or kw in img_id for kw in ad_keywords):
-                        continue
+                    # NOTE: On ne filtre plus par classe/ID car c'est trop agressif
+                    # (le mot 'ad' matche avec 'fade', 'loaded', etc.)
+                    # On se fie uniquement au filtre d'URL qui est plus précis
 
                     # Chercher dans tous les attributs possibles (lazy loading)
                     src = (
@@ -220,44 +261,53 @@ class DownloadService:
                         img.get('src')
                     )
 
-                    if src:
-                        # Exclure les URLs de publicités par mots-clés
-                        src_lower = src.lower()
-                        if any(kw in src_lower for kw in ad_keywords):
-                            print(f"  ❌ Ignoré (mot-clé pub): {src[:80]}...")
+                    if not src:
+                        logger.info(f"  ⚠️ Image sans src (ignorée)")
+                        continue
+
+                    logger.info(f"  🔍 Examen de l'image: {src[:80]}...")
+
+                    # Exclure les URLs de publicités par mots-clés
+                    src_lower = src.lower()
+                    if any(kw in src_lower for kw in ad_keywords):
+                        logger.info(f"  ❌ Ignoré (mot-clé pub): {src[:80]}...")
+                        continue
+
+                    # Exclure les URLs de publicités par domaine
+                    if any(domain in src_lower for domain in ad_domains):
+                        logger.info(f"  ❌ Ignoré (domaine pub): {src[:80]}...")
+                        continue
+
+                    # IMPORTANT: Ne garder QUE les images du CDN du manga (pghcdn.com, manhuaus.com)
+                    parsed_src = urlparse(src)
+                    allowed_domains = ['manhuaus.com', 'pghcdn.com', 'img.manhuaus.com']
+                    # Si l'URL a un domaine (pas relative), vérifier qu'il est autorisé
+                    if parsed_src.netloc:
+                        if not any(domain in parsed_src.netloc for domain in allowed_domains):
+                            logger.info(f"  ❌ Ignoré (domaine non autorisé): {src[:80]}...")
                             continue
+                    # Si URL relative (pas de netloc), on l'accepte
 
-                        # Exclure les URLs de publicités par domaine
-                        if any(domain in src_lower for domain in ad_domains):
-                            print(f"  ❌ Ignoré (domaine pub): {src[:80]}...")
-                            continue
+                    # Exclure les images trop petites (souvent des pubs/icônes)
+                    # Vérifier les attributs width/height si disponibles
+                    width = img.get('width')
+                    height = img.get('height')
+                    if width and height:
+                        try:
+                            w = int(width)
+                            h = int(height)
+                            # Ignorer les images < 200px (probablement des pubs/icônes)
+                            if w < 200 or h < 200:
+                                logger.info(f"  ❌ Ignoré (taille trop petite): {w}x{h} - {src[:80]}...")
+                                continue
+                        except (ValueError, TypeError):
+                            pass
 
-                        # IMPORTANT: Ne garder QUE les images du CDN du manga (pghcdn.com, manhuaus.com)
-                        parsed_src = urlparse(src)
-                        allowed_domains = ['manhuaus.com', 'pghcdn.com', 'img.manhuaus.com']
-                        if parsed_src.netloc and not any(domain in parsed_src.netloc for domain in allowed_domains):
-                            print(f"  ❌ Ignoré (domaine non autorisé): {src[:80]}...")
-                            continue
-
-                        # Exclure les images trop petites (souvent des pubs/icônes)
-                        # Vérifier les attributs width/height si disponibles
-                        width = img.get('width')
-                        height = img.get('height')
-                        if width and height:
-                            try:
-                                w = int(width)
-                                h = int(height)
-                                # Ignorer les images < 200px (probablement des pubs/icônes)
-                                if w < 200 or h < 200:
-                                    continue
-                            except (ValueError, TypeError):
-                                pass
-
-                        # Convertir en URL absolue si nécessaire
-                        full_url = urljoin(page_url, src)
-                        if full_url not in image_urls:
-                            print(f"  ✅ Ajouté: {full_url[:80]}...")
-                            image_urls.append(full_url)
+                    # Convertir en URL absolue si nécessaire
+                    full_url = urljoin(page_url, src)
+                    if full_url not in image_urls:
+                        logger.info(f"  ✅ Ajouté: {full_url[:80]}...")
+                        image_urls.append(full_url)
 
         # Si on a trouvé des images, on les retourne
         if image_urls:
@@ -268,12 +318,8 @@ class DownloadService:
         print("⚠️ Aucune image trouvée avec les sélecteurs prioritaires, utilisation du fallback...")
         all_images = soup.find_all('img')
         for img in all_images:
-            # Même filtrage que ci-dessus
-            img_class = ' '.join(img.get('class', [])).lower()
-            img_id = (img.get('id') or '').lower()
-
-            if any(kw in img_class or kw in img_id for kw in ad_keywords):
-                continue
+            # NOTE: On ne filtre plus par classe/ID (trop agressif)
+            # On se fie uniquement au filtre d'URL
 
             # Chercher dans tous les attributs possibles (lazy loading)
             src = (
@@ -306,6 +352,54 @@ class DownloadService:
 
         return image_urls
 
+    def _download_image_with_selenium(self, img_url: str, output_path: Path) -> bool:
+        """
+        Télécharge une image en utilisant Selenium (contourne les protections Cloudflare).
+
+        Args:
+            img_url: URL de l'image
+            output_path: Chemin de sortie
+
+        Returns:
+            True si succès, False sinon
+        """
+        if not self.selenium_driver:
+            return False
+
+        try:
+            # Utiliser fetch API via JavaScript pour télécharger l'image
+            script = """
+            const url = arguments[0];
+            return fetch(url)
+                .then(response => response.blob())
+                .then(blob => new Promise((resolve, reject) => {
+                    const reader = new FileReader();
+                    reader.onloadend = () => resolve(reader.result);
+                    reader.onerror = reject;
+                    reader.readAsDataURL(blob);
+                }));
+            """
+
+            # Exécuter le script et récupérer l'image en base64
+            data_url = self.selenium_driver.execute_async_script(script, img_url)
+
+            if not data_url:
+                return False
+
+            # Extraire les données base64
+            header, encoded = data_url.split(',', 1)
+            image_data = base64.b64decode(encoded)
+
+            # Sauvegarder l'image
+            with open(output_path, 'wb') as f:
+                f.write(image_data)
+
+            return True
+
+        except Exception as e:
+            logger.debug(f"Erreur Selenium download: {e}")
+            return False
+
     def download_images(
         self,
         image_urls: List[str],
@@ -336,41 +430,63 @@ class DownloadService:
                 progress_callback(idx, len(image_urls), f"Téléchargement image {idx}/{len(image_urls)}")
 
             try:
-                # Télécharger l'image avec Referer si fourni
-                headers = {}
+                # Déterminer l'extension depuis l'URL
+                url_ext = Path(urlparse(img_url).path).suffix
+                ext = url_ext if url_ext in ['.jpg', '.jpeg', '.png', '.webp', '.gif'] else '.jpg'
+
+                # Nom du fichier
+                file_name = f"page_{idx:04d}{ext}"
+                file_path = output_path / file_name
+
+                # Si Selenium est actif, utiliser Selenium pour télécharger (contourne Cloudflare)
+                if self.selenium_driver:
+                    logger.debug(f"Téléchargement avec Selenium: {img_url}")
+                    success = self._download_image_with_selenium(img_url, file_path)
+
+                    if success:
+                        downloaded_files.append(str(file_path))
+                        logger.info(f"✅ Téléchargé ({idx}/{len(image_urls)}): {file_name}")
+                        continue
+                    else:
+                        logger.warning(f"⚠️ Échec Selenium pour {img_url}, essai avec requests...")
+
+                # Fallback: télécharger avec requests
+                headers = {
+                    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+                    'Accept': 'image/avif,image/webp,image/apng,image/svg+xml,image/*,*/*;q=0.8',
+                    'Accept-Language': 'en-US,en;q=0.9',
+                    'Accept-Encoding': 'gzip, deflate, br',
+                    'Connection': 'keep-alive',
+                    'Sec-Fetch-Dest': 'image',
+                    'Sec-Fetch-Mode': 'no-cors',
+                    'Sec-Fetch-Site': 'same-site',
+                }
                 if referer:
                     headers['Referer'] = referer
 
-                response = self.session.get(img_url, headers=headers, timeout=30)
+                response = self.download_session.get(img_url, headers=headers, timeout=30)
                 response.raise_for_status()
-
-                # Déterminer l'extension
-                content_type = response.headers.get('content-type', '')
-                if 'jpeg' in content_type or 'jpg' in content_type:
-                    ext = '.jpg'
-                elif 'png' in content_type:
-                    ext = '.png'
-                elif 'webp' in content_type:
-                    ext = '.webp'
-                else:
-                    # Essayer d'extraire depuis l'URL
-                    url_ext = Path(urlparse(img_url).path).suffix
-                    ext = url_ext if url_ext in ['.jpg', '.jpeg', '.png', '.webp'] else '.jpg'
-
-                # Nom du fichier avec padding (ex: 001.jpg, 002.jpg, ...)
-                filename = f"{idx:03d}{ext}"
-                file_path = output_path / filename
 
                 # Sauvegarder
                 with open(file_path, 'wb') as f:
                     f.write(response.content)
 
                 downloaded_files.append(str(file_path))
+                logger.info(f"✅ Téléchargé ({idx}/{len(image_urls)}): {file_name}")
 
             except Exception as e:
                 print(f"⚠️ Erreur lors du téléchargement de {img_url}: {e}")
                 # Continuer avec les autres images
                 continue
+
+        # Fermer le driver Selenium si présent
+        if self.selenium_driver:
+            try:
+                logger.info("🔒 Fermeture du driver Selenium")
+                self.selenium_driver.quit()
+                self.selenium_driver = None
+            except Exception as e:
+                logger.warning(f"Erreur lors de la fermeture du driver: {e}")
 
         if not downloaded_files:
             raise RuntimeError("Aucune image n'a pu être téléchargée")

@@ -7,6 +7,10 @@ import time
 import cv2
 import numpy as np
 
+from app.utils.logger import get_logger
+
+logger = get_logger("ocr_service")
+
 # ---------------------------
 # Réglages perf (manga)
 # ---------------------------
@@ -293,21 +297,21 @@ class OCRService:
         langs = lang_map.get(lang_code, ["en"])
 
         if DEBUG_TIMINGS:
-            print(f"🔧 Initializing EasyOCR with languages: {langs}")
+            logger.info(f"🔧 Initializing EasyOCR with languages: {langs}")
 
         try:
             # GPU detection
             import torch
             use_gpu = torch.cuda.is_available()
             if DEBUG_TIMINGS:
-                print(f"   GPU available: {use_gpu}")
+                logger.info(f"   GPU available: {use_gpu}")
         except Exception:
             use_gpu = False
 
         self.reader = easyocr.Reader(langs, gpu=use_gpu)
 
         if DEBUG_TIMINGS:
-            print(f"✅ EasyOCR initialized (GPU: {use_gpu})")
+            logger.info(f"✅ EasyOCR initialized (GPU: {use_gpu})")
 
     def _run_raw_ocr(self, img_path: str, lang_code: str) -> OcrPack:
         t0 = time.perf_counter()
@@ -316,7 +320,7 @@ class OCRService:
         cache_key = f"{img_path}|w{MAX_WIDTH_FOR_OCR}"
         if CACHE_ENABLED and cache_key in self._cache:
             if DEBUG_TIMINGS:
-                print("Cache hit (OCR) -> instant")
+                logger.debug("Cache hit (OCR) -> instant")
 
             pack = self._cache[cache_key]
             self.last_output_img = pack.img_for_merge
@@ -344,7 +348,7 @@ class OCRService:
 
         except Exception as e:
             if DEBUG_TIMINGS:
-                print(f"⚠️ EXIF rotation with PIL failed ({e}), fallback to OpenCV")
+                logger.warning(f"⚠️ EXIF rotation with PIL failed ({e}), fallback to OpenCV")
             # Fallback: load with OpenCV (no EXIF support)
             img_bgr = cv2.imread(img_path, cv2.IMREAD_COLOR)
             if img_bgr is None:
@@ -402,14 +406,13 @@ class OCRService:
             self._cache[cache_key] = pack
 
         if DEBUG_TIMINGS:
-            print(
-                "Timings:",
-                f"read={(t_read - t0)*1000:.0f}ms |",
-                f"resize={(t_resize - t_read)*1000:.0f}ms |",
-                f"ocr={(t_ocr - t_resize):.2f}s |",
-                f"parse={(t_parse - t_ocr)*1000:.0f}ms |",
-                f"total={(t_parse - t0):.2f}s |",
-                f"scale={scale:.3f}",
+            logger.debug(
+                f"Timings: read={int((t_read - t0)*1000)}ms | "
+                f"resize={int((t_resize - t_read)*1000)}ms | "
+                f"ocr={(t_ocr - t_resize):.2f}s | "
+                f"parse={int((t_parse - t_ocr)*1000)}ms | "
+                f"total={(t_parse - t0):.2f}s | "
+                f"scale={scale:.3f}"
             )
 
         return pack
@@ -423,7 +426,7 @@ class OCRService:
         t1 = time.perf_counter()
 
         if DEBUG_TIMINGS:
-            print(f"fusion={(t1 - t0)*1000:.0f}ms | lines={len(pack.results)} -> merged={len(merged)}")
+            logger.debug(f"fusion={int((t1 - t0)*1000)}ms | lines={len(pack.results)} -> merged={len(merged)}")
 
         # Show the OCR image directly so boxes stay aligned 1:1
         self.last_output_img = pack.img_for_merge
